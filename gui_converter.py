@@ -186,7 +186,10 @@ class GPURenderer:
             # Compile shaders
             vs = gl_shaders.compileShader(_VERTEX_SHADER, gl.GL_VERTEX_SHADER)
             fs = gl_shaders.compileShader(_FRAGMENT_SHADER, gl.GL_FRAGMENT_SHADER)
-            self._shader_prog = gl_shaders.compileProgram(vs, fs)
+            # validate=False: glValidateProgram runs before any VAO/texture is
+            # bound, which some drivers spuriously fail even though the
+            # program links and runs fine. Linking is still checked below.
+            self._shader_prog = gl_shaders.compileProgram(vs, fs, validate=False)
             gl.glDeleteShader(vs)
             gl.glDeleteShader(fs)
 
@@ -553,6 +556,8 @@ class PreviewEngine:
 
     def __init__(self):
         self.scene: Optional[dict] = None
+        self.variants: list = []  # [(variant_name_or_None, scene_dict), ...] from load_scene()
+        self.variant_index: int = 0
         self.skel: Optional[dict] = None
         self.bones: list = []
         self.tr_name: dict = {}
@@ -592,9 +597,18 @@ class PreviewEngine:
         self._gpu_skeleton_lines: list = []
         self._gpu_frame_version: int = 0  # incremented each time data is updated
 
-    def load_bundle(self, src: Path) -> str:
-        """Load a Unity bundle and prepare for preview."""
-        scene = load_scene(src)
+    def load_bundle(self, src: Path, variant_index: int = 0) -> str:
+        """Load a Unity bundle and prepare for preview.
+
+        A bundle may pack several skins (N, NS1, NS2, ...) into one file;
+        load_scene() returns one (name, scene) pair per skin. The preview
+        can only show one at a time, so this shows `variant_index` (the
+        first by default) and reports how many others were found.
+        """
+        scenes = load_scene(src)
+        self.variants = scenes
+        self.variant_index = variant_index
+        variant_name, scene = scenes[variant_index]
         self.scene = scene
         self.atlases = scene["atlases"]
         self.parts = scene["parts"]
@@ -695,6 +709,9 @@ class PreviewEngine:
 
         msg = (f"骨骼: {len(bones)}  插槽: {len(slots)}  "
                f"动画: {len(animations)}  版本: {SPINE_VERSION}")
+        if len(scenes) > 1:
+            names = "、".join((n or "?") for n, _ in scenes)
+            msg += f"  [此文件含 {len(scenes)} 套皮肤: {names}；当前预览: {variant_name or '(默认)'}]"
         return msg
 
     def _pre_sample_animation(self, scene: dict, clip) -> dict:
@@ -889,8 +906,11 @@ class PreviewEngine:
         Uses GPU-accelerated rendering (OpenGL skinning + rasterization) when
         a GL context is active. Falls back to CPU cv2 rasterize otherwise.
         """
-        if self.scene is None or self.current_anim is None:
+        if self.scene is None:
             return np.zeros((self.H, self.W, 4), dtype=np.uint8)
+        # A bundle with no AnimationClip at all (a static prop/accessory)
+        # has no current_anim - still render its rest/bind pose rather
+        # than an empty frame.
 
         # Choose render resolution
         if target_w is not None:
@@ -955,7 +975,12 @@ class PreviewEngine:
         positions = skin_all(self.scene["parts"], world_fn)
         frame = rasterize(
             self.raster_cache, positions, to_canvas, W, H,
-            workers=1, opacities=opacities2,
+            # No current animation (a static prop/accessory) means
+            # _interpolate_cached_frame() has nothing cached and returns
+            # opacities2 = [] - rasterize() indexes opacities[i] per part,
+            # so an empty-but-not-None list would raise IndexError; treat
+            # it the same as "no override" (full opacity) instead.
+            workers=1, opacities=(opacities2 or None),
         )
         return frame
 
@@ -1031,17 +1056,21 @@ class ConvertWorker(QThread):
     def run(self):
         try:
             self.progress.emit(f"正在加载: {self.src}")
-            scene = load_scene(self.src)
+            scenes = load_scene(self.src)
 
             # Determine output
             if self.output_dir:
-                out = self.output_dir
+                out_base = self.output_dir
             else:
                 parent = self.src.parent if self.src.is_file() else self.src.parent
-                out = parent / ("spine_editor" if self.editor else "spine")
+                out_base = parent / ("spine_editor" if self.editor else "spine")
 
-            self.progress.emit(f"正在导出到: {out}")
-            export_spine(scene, out, editor=self.editor)
+            if len(scenes) > 1:
+                self.progress.emit(f"检测到 {len(scenes)} 套皮肤，分别导出到子文件夹")
+            for variant_name, scene in scenes:
+                out = out_base / variant_name if variant_name else out_base
+                self.progress.emit(f"正在导出到: {out}")
+                export_spine(scene, out, editor=self.editor)
 
             # Create preview engine
             engine = PreviewEngine()
@@ -1049,7 +1078,7 @@ class ConvertWorker(QThread):
             self.progress.emit(f"预览就绪: {msg}")
             self.preview_ready.emit(engine)
 
-            self.finished_signal.emit(True, f"导出成功: {out}")
+            self.finished_signal.emit(True, f"导出成功: {out_base}")
         except Exception as e:
             self.progress.emit(f"错误: {e}")
             traceback.print_exc()
@@ -1097,20 +1126,24 @@ class BatchConvertWorker(QThread):
             self.file_progress.emit(i + 1, total)
             try:
                 self.progress.emit(f"[{i + 1}/{total}] 正在处理: {src}")
-                scene = load_scene(src)
-                # Use the atlas texture base name (e.g. "3P_BlackWyrm_NS1")
-                # as the folder name. If duplicate, append _2, _3, etc.
-                base_name = self._atlas_base_name(scene)
-                if base_name in used_names:
-                    used_names[base_name] += 1
-                    folder_name = f"{base_name}_{used_names[base_name]}"
-                else:
-                    used_names[base_name] = 1
-                    folder_name = base_name
+                scenes = load_scene(src)
+                # A bundle may pack several skins into one file; each gets
+                # its own folder. Prefer the skin's own name when the file
+                # was split, otherwise fall back to the atlas texture base
+                # name (e.g. "3P_BlackWyrm_NS1") as before. Duplicate names
+                # get _2, _3, etc.
+                for variant_name, scene in scenes:
+                    base_name = variant_name or self._atlas_base_name(scene)
+                    if base_name in used_names:
+                        used_names[base_name] += 1
+                        folder_name = f"{base_name}_{used_names[base_name]}"
+                    else:
+                        used_names[base_name] = 1
+                        folder_name = base_name
 
-                out = self.output_base / folder_name
-                export_spine(scene, out, editor=self.editor)
-                self.progress.emit(f"[{i + 1}/{total}] 完成: {src.name} -> {folder_name}/")
+                    out = self.output_base / folder_name
+                    export_spine(scene, out, editor=self.editor)
+                    self.progress.emit(f"[{i + 1}/{total}] 完成: {src.name} -> {folder_name}/")
                 success += 1
             except Exception as e:
                 self.progress.emit(f"[{i + 1}/{total}] 失败: {src} - {e}")
@@ -1525,7 +1558,14 @@ class PreviewCanvas(QOpenGLWidget):
         Uses a frame version counter to skip re-rendering when the bone data
         hasn't changed (render thread produces frames slower than display refresh).
         """
-        if not self._gl_ready or not self.engine:
+        if not self._gl_ready or not self.engine or not self._use_gpu:
+            # CPU fallback mode: this must be a complete no-op. Any GL calls
+            # here (glClear, glDisable(GL_BLEND), ...) run on the same FBO
+            # that Qt's own QPainter compositing uses for paintEvent()'s
+            # drawImage() call right after this - leftover GL state from an
+            # unconditional glClear/glDisable(GL_BLEND) here can stop that
+            # image from showing up at all, producing a black canvas even
+            # though a valid frame was rendered and handed to QPainter.
             return
 
         # Skip if no new frame data since last paint AND view hasn't changed
@@ -1710,8 +1750,11 @@ class PreviewCanvas(QOpenGLWidget):
                     scx, scy = world_to_widget(cx, cy)
                     painter.drawLine(int(spx), int(spy), int(scx), int(scy))
                     painter.drawEllipse(int(scx) - 3, int(scy) - 3, 6, 6)
-        elif sk_lines and self.engine and self.engine.show_skeleton and not self._use_gpu:
-            # CPU path: skeleton lines are in canvas pixel space
+        elif self.engine and not self._use_gpu:
+            # CPU path: nothing else draws the frame (no custom GL calls run
+            # when GPU init failed), so the rendered image itself has to be
+            # drawn here too - it must NOT be gated on sk_lines/show_skeleton,
+            # those only control the optional bone overlay drawn on top of it.
             with self._render_lock:
                 frame_bgra = self._frame_bgra
             if frame_bgra is not None and frame_bgra.size > 0:
@@ -1729,17 +1772,18 @@ class PreviewCanvas(QOpenGLWidget):
                     dx, dy, dw, dh, scale = self._img_display_rect(iw_img, ih_img)
                     if dw > 0 and dh > 0:
                         painter.drawImage(QRectF(dx, dy, dw, dh), self._frame_qimage)
-                    scale_x = dw / iw_img
-                    scale_y = dh / ih_img
-                    painter.setPen(QPen(QColor(233, 69, 96, 180), 1.5))
-                    painter.setBrush(QBrush(QColor(233, 69, 96)))
-                    for (px, py, cx, cy) in sk_lines:
-                        spx = px * scale_x + dx
-                        spy = py * scale_y + dy
-                        scx = cx * scale_x + dx
-                        scy = cy * scale_y + dy
-                        painter.drawLine(int(spx), int(spy), int(scx), int(scy))
-                        painter.drawEllipse(int(scx) - 3, int(scy) - 3, 6, 6)
+                    if sk_lines and self.engine.show_skeleton:
+                        scale_x = dw / iw_img
+                        scale_y = dh / ih_img
+                        painter.setPen(QPen(QColor(233, 69, 96, 180), 1.5))
+                        painter.setBrush(QBrush(QColor(233, 69, 96)))
+                        for (px, py, cx, cy) in sk_lines:
+                            spx = px * scale_x + dx
+                            spy = py * scale_y + dy
+                            scx = cx * scale_x + dx
+                            scy = cy * scale_y + dy
+                            painter.drawLine(int(spx), int(spy), int(scx), int(scy))
+                            painter.drawEllipse(int(scx) - 3, int(scy) - 3, 6, 6)
 
         # Overlay text
         if self.engine and self.engine.current_anim:

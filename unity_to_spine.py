@@ -50,7 +50,7 @@ GIF_FPS = int(os.environ.get("GIF_FPS", "24"))
 GIF_BG = os.environ.get("GIF_BG", "ffffff")
 GIF_WORKERS = int(os.environ.get("GIF_WORKERS", "0"))  # 0 = auto (cpu count, cap 8)
 EPS = 1e-4
-ATLAS_SUFFIX_RE = re.compile(r"(part\d+)$", re.I)
+ATLAS_SUFFIX_RE = re.compile(r"(parts?\d+)$", re.I)
 
 # Unity AnimationClip generic binding IDs (Transform=4, GameObject=1, SMR=137).
 GO_TYPE = 1
@@ -196,7 +196,15 @@ def skin_part(part, world):
 
 
 def skin_all(parts, world):
-    return [skin_part(p, world) for p in parts]
+    out = []
+    for p in parts:
+        try:
+            out.append(skin_part(p, world))
+        except (KeyError, IndexError):
+            # Same malformed bone/bind data build_slots_and_skin() also
+            # skips for this part - excluded from the bounds calc too.
+            pass
+    return out
 
 
 def bounds_of(positions, pad=0.0):
@@ -625,7 +633,7 @@ def _mouth_bone_active(scene, go_active, bone_name: str) -> bool:
     tr2go = {t: g for g, t in go2tr.items()}
     for tr, go in tr2go.items():
         if go_name.get(go) == bone_name:
-            return transform_active(tr, go_active, tr_to_path, TR)
+            return transform_active(tr, go_active, tr_to_path, TR, scene.get("tr_active_static"))
     return True
 
 
@@ -660,14 +668,21 @@ def _mouth_crossfade_opacity(part_name, scene, go_active, smr_props) -> float | 
     return 1.0 - idle_weight
 
 
-def transform_active(tr, go_active, tr_to_path, TR) -> bool:
-    """False when this transform or an animated ancestor is explicitly disabled."""
+def transform_active(tr, go_active, tr_to_path, TR, tr_active_static=None) -> bool:
+    """False when this transform or an ancestor is disabled - either by this
+    clip's own active-toggle curve, or (when the clip never touches it) by
+    the object's static default state (many alt-expression parts start
+    disabled and are only switched on by the clip that uses them)."""
+    tr_active_static = tr_active_static or {}
     while tr:
         path = tr_to_path.get(tr)
+        active = None
         if path is not None:
             active = go_active.get(path_hash(path))
-            if active is not None and active < 0.5:
-                return False
+        if active is None:
+            active = 1.0 if tr_active_static.get(tr, True) else 0.0
+        if active < 0.5:
+            return False
         tr = TR.get(tr, {}).get("father", 0)
     return True
 
@@ -708,7 +723,7 @@ def part_opacities(scene, go_active, smr_alpha, smr_props) -> list[float]:
             out.append(opacity)
             continue
 
-        if go_tr and not transform_active(go_tr, go_active, tr_to_path, TR):
+        if go_tr and not transform_active(go_tr, go_active, tr_to_path, TR, scene.get("tr_active_static")):
             out.append(0.0)
             continue
         opacity = 1.0
@@ -732,12 +747,14 @@ def load_atlases(objs) -> tuple[dict[str, dict[str, Any]], dict[int, str]]:
     """Return atlases keyed by partN and Texture2D path_id -> atlas key."""
     atlases: dict[str, dict[str, Any]] = {}
     tex2atlas: dict[int, str] = {}
+    unmatched: list[tuple[int, Any]] = []
     for o in objs:
         if o.type.name != "Texture2D":
             continue
         data = o.read()
         key = atlas_key_from_name(data.m_Name)
         if key is None:
+            unmatched.append((o.path_id, data))
             continue
         img = data.image
         w, h = img.size
@@ -749,17 +766,36 @@ def load_atlases(objs) -> tuple[dict[str, dict[str, Any]], dict[int, str]]:
             "height": h,
         }
         tex2atlas[o.path_id] = key
+
+    # No partN/partsN-suffixed texture found. If there's exactly one
+    # candidate, it's the whole atlas (e.g. "FullbodyIMG_X_N"). If there are
+    # several (a body atlas alongside small unrelated utility/gizmo/UI
+    # textures - IK handles, bone dots, glow FX...), assume the largest one
+    # by pixel area is the real atlas page rather than failing outright.
+    if not atlases and unmatched:
+        path_id, data = max(unmatched, key=lambda pair: pair[1].image.size[0] * pair[1].image.size[1])
+        img = data.image
+        w, h = img.size
+        key = "part1"
+        atlases[key] = {
+            "key": key,
+            "name": data.m_Name or key,
+            "image": img,
+            "width": w,
+            "height": h,
+        }
+        tex2atlas[path_id] = key
+
     return atlases, tex2atlas
 
 
-def load_scene(src: Path) -> dict[str, Any]:
-    env = UnityPy.load(str(src))
-    objs = list(env.objects)
+def build_scene_from_objs(objs) -> dict[str, Any]:
     byid = {o.path_id: o for o in objs}
 
     TR = {}
     go2tr = {}
     go_name = {}
+    go_active_static: dict[int, bool] = {}
     tr_children = {}
     for o in objs:
         if o.type.name == "Transform":
@@ -774,7 +810,16 @@ def load_scene(src: Path) -> dict[str, Any]:
             go2tr[getattr(d.m_GameObject, "path_id", 0)] = o.path_id
             tr_children[o.path_id] = [getattr(c, "path_id", 0) for c in d.m_Children]
         elif o.type.name == "GameObject":
-            go_name[o.path_id] = o.read().m_Name
+            gd = o.read()
+            go_name[o.path_id] = gd.m_Name
+            go_active_static[o.path_id] = bool(getattr(gd, "m_IsActive", True))
+
+    # Many parts (alternate face expressions etc.) start disabled and are
+    # only switched on by specific clips; index that baseline by transform
+    # so a clip that never touches a given object doesn't wrongly show it.
+    tr_active_static = {
+        tr: go_active_static.get(gid, True) for gid, tr in go2tr.items()
+    }
 
     atlases, tex2atlas = load_atlases(objs)
     if not atlases:
@@ -784,7 +829,10 @@ def load_scene(src: Path) -> dict[str, Any]:
         mo = byid.get(mat_pid)
         if not mo:
             return None
-        return atlas_key_from_name(mo.read().m_Name)
+        key = atlas_key_from_name(mo.read().m_Name)
+        if key is None and len(atlases) == 1:
+            key = next(iter(atlases))
+        return key
 
     parts = []
     for o in objs:
@@ -797,7 +845,10 @@ def load_scene(src: Path) -> dict[str, Any]:
         mesh = byid[mp].read()
         mats = smr.m_Materials or []
         atlas = atlas_for_material(getattr(mats[0], "path_id", 0)) if mats else None
-        if atlas is None:
+        if atlas is None or atlas not in atlases:
+            # Material names a partN/partsN page with no matching texture
+            # anywhere in the bundle - an orphaned/unused material, not
+            # something we can render.
             continue
 
         bones = [getattr(b, "path_id", 0) for b in smr.m_Bones]
@@ -871,12 +922,20 @@ def load_scene(src: Path) -> dict[str, Any]:
         h.process()
         vc = h.m_VertexCount
         sv = np.array(h.m_Vertices, dtype=np.float64).reshape(vc, 3)
-        sv2 = np.c_[sv[:, :2], np.zeros(vc), np.ones(vc)]
 
+        # UV lookup uses the un-flipped mesh - flip mirrors where the quad
+        # sits in local/world space, not which source pixels it samples.
         ah = atlases[atlas]["height"]
         ax = rect.x + (sv[:, 0] * ptu + piv.x * rect.width)
         ay = rect.y + (sv[:, 1] * ptu + piv.y * rect.height)
         src = np.c_[ax, ah - ay]
+
+        sv_local = sv.copy()
+        if getattr(sr, "m_FlipX", False):
+            sv_local[:, 0] = -sv_local[:, 0]
+        if getattr(sr, "m_FlipY", False):
+            sv_local[:, 1] = -sv_local[:, 1]
+        sv2 = np.c_[sv_local[:, :2], np.zeros(vc), np.ones(vc)]
 
         faces = []
         for sm in h.get_triangles():
@@ -922,7 +981,304 @@ def load_scene(src: Path) -> dict[str, Any]:
     return dict(
         objs=objs, TR=TR, atlases=atlases, parts=parts, hash2tr=hash2tr,
         tr_to_path=tr_to_path, go2tr=go2tr, go_name=go_name,
+        tr_active_static=tr_active_static,
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-variant bundles: some files pack several skins (N, NS1, NS2, …) of
+# the same character - each with its own Animator-rooted bone hierarchy and
+# its own (same-named) set of AnimationClips - into a single AssetBundle.
+# The functions below detect those sub-skeletons and split the bundle's
+# objects into one self-contained group per variant, so each is exported as
+# its own clean Spine skeleton instead of being merged into one.
+# ---------------------------------------------------------------------------
+SCOPED_TYPES = {
+    "Transform", "GameObject", "SkinnedMeshRenderer", "SpriteRenderer",
+    "Animator", "AnimationClip", "Texture2D",
+}
+
+
+def build_hash2tr(root_tr, tr_children, go2tr, go_name):
+    tr2go = {t: g for g, t in go2tr.items()}
+
+    def name_of(tr):
+        return go_name.get(tr2go.get(tr, 0), "")
+
+    hash2tr = {}
+    tr_to_path = {}
+
+    def walk(tr, prefix):
+        for c in tr_children.get(tr, []):
+            nm = name_of(c)
+            p = nm if prefix == "" else prefix + "/" + nm
+            tr_to_path[c] = p
+            hash2tr[path_hash(p)] = c
+            walk(c, p)
+
+    walk(root_tr, "")
+    tr_to_path[root_tr] = ""
+    hash2tr[path_hash("")] = root_tr
+    return hash2tr, tr_to_path
+
+
+def discover_char_roots(objs):
+    """Find distinct rigged sub-skeletons: Animator roots (with an actual
+    AnimatorController - excludes stray unused reference meshes that also
+    happen to carry an Animator component) whose subtree contains a
+    SkinnedMeshRenderer, keeping only the outermost ones."""
+    go2tr = {}
+    go_name = {}
+    tr_children = {}
+    for o in objs:
+        if o.type.name == "Transform":
+            d = o.read()
+            go2tr[getattr(d.m_GameObject, "path_id", 0)] = o.path_id
+            tr_children[o.path_id] = [getattr(c, "path_id", 0) for c in d.m_Children]
+        elif o.type.name == "GameObject":
+            go_name[o.path_id] = o.read().m_Name
+    tr2go = {t: g for g, t in go2tr.items()}
+
+    smr_trs = set()
+    animator_roots = []  # (tr, controller_path_id)
+    for o in objs:
+        if o.type.name in ("SkinnedMeshRenderer", "SpriteRenderer"):
+            tr = go2tr.get(getattr(o.read().m_GameObject, "path_id", 0))
+            if tr is not None:
+                smr_trs.add(tr)
+        elif o.type.name == "Animator":
+            d = o.read()
+            tr = go2tr.get(getattr(d.m_GameObject, "path_id", 0))
+            ctrl_pid = getattr(d.m_Controller, "path_id", 0)
+            if tr is not None and ctrl_pid:
+                animator_roots.append((tr, ctrl_pid))
+
+    def subtree(root):
+        seen = set()
+        stack = [root]
+        while stack:
+            t = stack.pop()
+            if t in seen:
+                continue
+            seen.add(t)
+            stack.extend(tr_children.get(t, []))
+        return seen
+
+    candidates = [(r, ctrl, subtree(r)) for r, ctrl in animator_roots]
+    candidates = [(r, ctrl, sub) for r, ctrl, sub in candidates if sub & smr_trs]
+    maximal = [
+        (root, ctrl, sub) for root, ctrl, sub in candidates
+        if not any(root != other and root in other_sub for other, _, other_sub in candidates)
+    ]
+
+    controller_names = {}
+    for o in objs:
+        if o.type.name == "AnimatorController":
+            try:
+                controller_names[o.path_id] = o.read().m_Name
+            except Exception:
+                pass
+
+    used_names: dict[str, int] = {}
+    roots_info = []
+    seen_roots = set()
+    for root, ctrl, sub in maximal:
+        if root in seen_roots:
+            continue
+        seen_roots.add(root)
+        raw = (
+            controller_names.get(ctrl)
+            or go_name.get(tr2go.get(root, 0))
+            or f"root_{root}"
+        )
+        raw = re.sub(r"_?[Cc]on(troller)?$", "", raw)
+        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("_") or f"root_{root}"
+        if name in used_names:
+            used_names[name] += 1
+            name = f"{name}_{used_names[name]}"
+        else:
+            used_names[name] = 0
+        roots_info.append((root, sub, name, ctrl))
+
+    return roots_info, go2tr, go_name, tr_children
+
+
+def collect_variant_texture_names(objs, subtree, go2tr):
+    """Names of textures actually used by this variant's parts: direct
+    Sprite->texture references, plus the material names its
+    SkinnedMeshRenderers use (textures/materials share names by convention).
+    Also returns the partN/partsN keys those materials resolve to, so a
+    globally-unique key can be scoped to only the variant that wants it."""
+    byid = {o.path_id: o for o in objs}
+    names = set()
+    keys = set()
+    for o in objs:
+        if o.type.name not in ("SkinnedMeshRenderer", "SpriteRenderer"):
+            continue
+        d = o.read()
+        tr = go2tr.get(getattr(d.m_GameObject, "path_id", 0))
+        if tr is None or tr not in subtree:
+            continue
+        if o.type.name == "SkinnedMeshRenderer":
+            for m in d.m_Materials or []:
+                mo = byid.get(getattr(m, "path_id", 0))
+                if mo:
+                    try:
+                        mname = mo.read().m_Name
+                        names.add(mname)
+                        key = atlas_key_from_name(mname)
+                        if key is not None:
+                            keys.add(key)
+                    except Exception:
+                        pass
+        else:
+            sp_ptr = getattr(d, "m_Sprite", None)
+            sp_o = byid.get(getattr(sp_ptr, "path_id", 0)) if sp_ptr else None
+            if sp_o:
+                try:
+                    tex_ptr = getattr(sp_o.read().m_RD, "texture", None)
+                    tex_o = byid.get(getattr(tex_ptr, "path_id", 0))
+                    if tex_o:
+                        names.add(tex_o.read().m_Name)
+                except Exception:
+                    pass
+    return names, keys
+
+
+def collect_ambiguous_atlas_keys(objs):
+    """partN/partsN keys shared by more than one Texture2D in the whole
+    bundle - only these actually need per-variant disambiguation; a unique
+    key can never collide across variants, so always keep it."""
+    groups: dict[str, int] = {}
+    for o in objs:
+        if o.type.name != "Texture2D":
+            continue
+        try:
+            key = atlas_key_from_name(o.read().m_Name)
+        except Exception:
+            key = None
+        if key is not None:
+            groups[key] = groups.get(key, 0) + 1
+    return {k for k, n in groups.items() if n > 1}
+
+
+def build_objs_for_variant(objs, subtree, assigned_clip_pids, root_tr, go2tr, texture_names, used_keys, ambiguous_keys):
+    out = []
+    for o in objs:
+        t = o.type.name
+        if t not in SCOPED_TYPES:
+            out.append(o)
+            continue
+        if t == "Transform":
+            if o.path_id in subtree:
+                out.append(o)
+        elif t == "GameObject":
+            tr = go2tr.get(o.path_id)
+            if tr is not None and tr in subtree:
+                out.append(o)
+        elif t in ("SkinnedMeshRenderer", "SpriteRenderer"):
+            tr = go2tr.get(getattr(o.read().m_GameObject, "path_id", 0))
+            if tr is not None and tr in subtree:
+                out.append(o)
+        elif t == "Animator":
+            if go2tr.get(getattr(o.read().m_GameObject, "path_id", 0)) == root_tr:
+                out.append(o)
+        elif t == "AnimationClip":
+            if o.path_id in assigned_clip_pids:
+                out.append(o)
+        elif t == "Texture2D":
+            try:
+                tname = o.read().m_Name
+            except Exception:
+                tname = None
+            key = atlas_key_from_name(tname) if tname else None
+            if key is not None and key not in ambiguous_keys and key in used_keys:
+                out.append(o)  # unique partN/partsN key this variant's own materials want
+            elif not texture_names:
+                out.append(o)  # fallback: no resolvable name -> keep all
+            elif tname in texture_names:
+                out.append(o)
+    return out
+
+
+def split_scene(objs):
+    """[(variant_name_or_None, objs), ...]. A single-skeleton bundle comes
+    back unchanged as one [(None, objs)] entry."""
+    roots_info, go2tr, go_name, tr_children = discover_char_roots(objs)
+    if len(roots_info) < 2:
+        return [(None, objs)]
+
+    all_clip_pids = {o.path_id for o in objs if o.type.name == "AnimationClip"}
+
+    # Ground truth: each variant's own AnimatorController lists exactly the
+    # clips it uses (variants can share identical bone-name conventions, so
+    # clip bindings alone can't tell two skeletons apart - see PR notes).
+    controller_clips: dict[int, set[int]] = {}
+    for o in objs:
+        if o.type.name != "AnimatorController":
+            continue
+        d = o.read()
+        pids = {getattr(p, "path_id", 0) for p in (d.m_AnimationClips or [])}
+        controller_clips[o.path_id] = pids & all_clip_pids
+
+    assigned: dict[int, set[int]] = {root_tr: set() for root_tr, _, _, _ in roots_info}
+    covered: set[int] = set()
+    for root_tr, _, _, ctrl in roots_info:
+        clips = controller_clips.get(ctrl)
+        if clips:
+            assigned[root_tr] |= clips
+            covered |= clips
+
+    # Fallback for any clip no controller claimed: best bone-path match.
+    leftover = all_clip_pids - covered
+    if leftover:
+        root_hash = {
+            root_tr: build_hash2tr(root_tr, tr_children, go2tr, go_name)[0]
+            for root_tr, _, _, _ in roots_info
+        }
+        byid = {o.path_id: o for o in objs}
+        for pid in leftover:
+            clip = byid[pid].read()
+            gb = clip.m_ClipBindingConstant.genericBindings
+            best_root, best_score = None, 0
+            for root_tr, _, _, _ in roots_info:
+                score = sum(1 for b in gb if b.typeID == 4 and b.path in root_hash[root_tr])
+                if score > best_score:
+                    best_score, best_root = score, root_tr
+            if best_root is not None:
+                assigned[best_root].add(pid)
+
+    ambiguous_keys = collect_ambiguous_atlas_keys(objs)
+    out = []
+    for root_tr, sub, name, _ in roots_info:
+        tex_names, used_keys = collect_variant_texture_names(objs, sub, go2tr)
+        variant_objs = build_objs_for_variant(
+            objs, sub, assigned[root_tr], root_tr, go2tr, tex_names, used_keys, ambiguous_keys,
+        )
+        out.append((name, variant_objs))
+    return out
+
+
+def load_scene(src: Path) -> list[tuple[str | None, dict[str, Any]]]:
+    env = UnityPy.load(str(src))
+    objs = list(env.objects)
+    scenes = []
+    for name, variant_objs in split_scene(objs):
+        try:
+            scenes.append((name, build_scene_from_objs(variant_objs)))
+        except RuntimeError as e:
+            label = name or "(default)"
+            print(f"  !! variant {label} skipped: {e}")
+    if not scenes:
+        if not any(o.type.name == "Texture2D" for o in objs):
+            raise RuntimeError(
+                "no exportable variant found in this bundle: it has no "
+                "Texture2D objects at all - its atlas is stored in a "
+                "different AssetBundle this file depends on, which this "
+                "tool can't follow"
+            )
+        raise RuntimeError("no exportable variant found in this bundle")
+    return scenes
 
 
 # ---------------------------------------------------------------------------
@@ -1203,17 +1559,32 @@ def build_slot_opacity_tracks(scene, clip, sampler, times) -> dict:
 def build_slots_and_skin(scene, tr_name, bone_index, editor=False):
     parts = scene["parts"]
     atlases = scene["atlases"]
+    TR = scene["TR"]
+    tr_to_path = scene["tr_to_path"]
+    tr_active_static = scene.get("tr_active_static") or {}
 
     slots = []
     attachments = {}
     for p, name in zip(parts, part_slot_names(parts)):
-        slots.append({"name": name, "bone": "root", "attachment": name})
-
         page = atlases[p["atlas"]]
         aw, ah = page["width"], page["height"]
-        hull_len, uvs, tris, verts, edges = build_spine_mesh_attachment(
-            p, tr_name, bone_index, aw, ah,
-        )
+        try:
+            hull_len, uvs, tris, verts, edges = build_spine_mesh_attachment(
+                p, tr_name, bone_index, aw, ah,
+            )
+        except (KeyError, IndexError) as e:
+            # Some meshes reference a bone slot Unity never actually bound
+            # (a null bone pointer, or one outside this skeleton) - skip
+            # just that part rather than failing the whole export.
+            print(f"  !! part {name} skipped: {e!r}")
+            continue
+        slot = {"name": name, "bone": "root", "attachment": name}
+        go_tr = p.get("go_tr_pid") or p.get("tr_pid")
+        if go_tr and not transform_active(go_tr, {}, tr_to_path, TR, tr_active_static):
+            # Starts disabled in Unity (e.g. an alt facial expression) -
+            # hide it in the setup pose; clips that use it re-enable it.
+            slot["color"] = "ffffff00"
+        slots.append(slot)
         width, height = mesh_image_size(p, atlases)
 
         attachments[name] = {
@@ -1510,21 +1881,9 @@ def main(argv=None):
         p.error(f"source not found: {src}")
 
     print(f"loading {src}")
-    scene = load_scene(src)
-
-    if args.gif or args.gif_only:
-        gif_dir = resolve_gif_dir(src, args.output)
-        export_gifs(
-            scene, gif_dir,
-            clip_filter=args.gif_clips,
-            target_w=args.gif_width,
-            fps=args.gif_fps,
-            bg=args.gif_bg,
-            workers=args.gif_workers,
-        )
-
-    if args.gif_only:
-        return
+    scenes = load_scene(src)
+    if len(scenes) > 1:
+        print(f"  {len(scenes)} character variants: {', '.join(n for n, _ in scenes)}")
 
     spine_export = os.environ.get("SPINE_EXPORT", "").lower()
     if args.both:
@@ -1534,13 +1893,36 @@ def main(argv=None):
     else:
         modes = (True,)  # default: editor
 
-    for editor in modes:
-        out = resolve_output(src, args.output, editor)
-        if args.both and editor:
-            out = out.parent / "spine_editor" if args.output is None else out
-        elif args.both and not editor and args.output is None:
-            out = out.parent / "spine"
-        export_spine(scene, out, editor=editor)
+    for variant_name, scene in scenes:
+        if not scene["parts"]:
+            label = variant_name or "(default)"
+            print(f"  !! variant {label} skipped: no renderable parts")
+            continue
+        if args.gif or args.gif_only:
+            gif_dir = resolve_gif_dir(src, args.output)
+            if variant_name is not None:
+                gif_dir = gif_dir / variant_name
+            export_gifs(
+                scene, gif_dir,
+                clip_filter=args.gif_clips,
+                target_w=args.gif_width,
+                fps=args.gif_fps,
+                bg=args.gif_bg,
+                workers=args.gif_workers,
+            )
+
+        if args.gif_only:
+            continue
+
+        for editor in modes:
+            out = resolve_output(src, args.output, editor)
+            if args.both and editor:
+                out = out.parent / "spine_editor" if args.output is None else out
+            elif args.both and not editor and args.output is None:
+                out = out.parent / "spine"
+            if variant_name is not None:
+                out = out / variant_name
+            export_spine(scene, out, editor=editor)
 
 
 if __name__ == "__main__":
